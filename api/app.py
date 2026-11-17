@@ -324,10 +324,6 @@ def status():
             "cycle_report": report,
             "credits_used_today": credits_today,
             "credits_free_tier_per_month": 500,
-            "ledger_balance_dollars": (
-                round(balance / 100, 2) if balance is not None else None
-            ),
-            "ledger_balance_cents": balance,
             "odds_api_key_set": bool(os.environ.get("ODDS_API_KEY")),
             "last_run_status": last_status,
             "last_run_summary": last_summary,
