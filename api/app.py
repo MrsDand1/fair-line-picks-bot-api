@@ -1,10 +1,11 @@
-"""Fair Line Picks Bot — Stage 1 deploy service (Render, free tier).
+"""Fair Line Picks Bot — Stage 2 deploy service (Render, free tier).
 
-Small FastAPI app that runs the Stage 1 daily capture cycle once a day,
+Small FastAPI app that runs the Stage 2 daily capture cycle once a day,
 pre-game, in the morning US/Eastern (target ~08:00 ET), then idles.
 Style follows the BTC Oracle Pro tracker (supervised scheduler thread +
 watchdog, /health endpoint); no trading or signal logic is reused here —
-this service only captures data, exactly like `python3 scan.py all`.
+this service only captures data and evaluates the paper-tracking rule,
+exactly like `python3 scan.py all` (kalshi -> odds -> stats -> evaluate).
 
 FREE-TIER HONESTY: Render's free web services sleep after ~15 min idle
 and the disk is ephemeral, so history resets on restart (same caveat as
@@ -19,8 +20,10 @@ it (and without ODDS_API_STUB=1) the odds leg refuses cleanly and the run
 is recorded as incomplete — the scheduler retries hourly until 20:00 ET.
 
 No signups, no accounts, no money, no bets, no trades, no order-placement
-code anywhere in this service.
+code anywhere in this service. The rule is paper tracking only: picks are
+logged, never traded, and the ledger is never written by the rule.
 """
+import json
 import os
 import sys
 import threading
@@ -41,7 +44,7 @@ import ledger as ledger_mod
 import scan
 import store
 
-app = FastAPI(title="Fair Line Picks Bot — Stage 1 capture service")
+app = FastAPI(title="Fair Line Picks Bot — Stage 2 capture service")
 
 # CORS: the public viewer page reads /health + /status straight from the
 # browser (GET only, same as the BTC Oracle Pro API). Public read-only data.
@@ -112,8 +115,10 @@ def should_run(now, last_attempt_cycle, last_attempt_ts, last_attempt_complete):
 
 def cycle_is_complete(conn, cycle_date):
     """True when today's cycle already has Kalshi snapshots and all four
-    odds sports captured. Used after restarts (state is fresh, DB may not
-    be) so a completed day is never re-run."""
+    odds sports captured, plus stats snapshots and rule evaluations.
+    Used after restarts (state is fresh, DB may not be) so a completed
+    day is never re-run. A day with no stats/rule rows is NOT complete,
+    otherwise the scheduler would never retry the rule."""
     k = conn.execute(
         "SELECT COUNT(*) AS n FROM kalshi_snapshots WHERE cycle_date = ?",
         (cycle_date,),
@@ -122,7 +127,15 @@ def cycle_is_complete(conn, cycle_date):
         "SELECT COUNT(*) AS n FROM odds_snapshots WHERE cycle_date = ?",
         (cycle_date,),
     ).fetchone()["n"]
-    return k > 0 and o >= len(config.ODDS_SPORTS)
+    s = conn.execute(
+        "SELECT COUNT(*) AS n FROM stats_snapshots WHERE cycle_date = ?",
+        (cycle_date,),
+    ).fetchone()["n"]
+    r = conn.execute(
+        "SELECT COUNT(*) AS n FROM rule_evaluations WHERE cycle_date = ?",
+        (cycle_date,),
+    ).fetchone()["n"]
+    return k > 0 and o >= len(config.ODDS_SPORTS) and s > 0 and r > 0
 
 
 def run_odds_leg(conn, cycle_date):
@@ -134,14 +147,17 @@ def run_odds_leg(conn, cycle_date):
 
 
 def run_daily_cycle(conn, cycle_date):
-    """Run both legs of the daily cycle. Never raises: a failing leg is
-    recorded in the summary and the run is marked partial."""
+    """Run all legs of the daily cycle: kalshi -> odds -> stats -> evaluate.
+    Never raises: a failing leg is recorded in the summary and the run
+    is marked partial."""
     started = store.utcnow_iso()
     summary = {
         "cycle_date": cycle_date,
         "started_at": started,
         "kalshi": None,
         "odds": None,
+        "stats": None,
+        "evaluate": None,
         "status": "complete",
         "complete": False,
     }
@@ -154,6 +170,16 @@ def run_daily_cycle(conn, cycle_date):
         summary["odds"] = run_odds_leg(conn, cycle_date)
     except Exception as exc:  # noqa: BLE001
         summary["odds"] = {"error": str(exc)}
+        summary["status"] = "partial"
+    try:
+        summary["stats"] = scan.scan_stats(conn, cycle_date)
+    except Exception as exc:  # noqa: BLE001
+        summary["stats"] = {"error": str(exc)}
+        summary["status"] = "partial"
+    try:
+        summary["evaluate"] = scan.evaluate_rule(conn, cycle_date)
+    except Exception as exc:  # noqa: BLE001
+        summary["evaluate"] = {"error": str(exc)}
         summary["status"] = "partial"
     summary["complete"] = cycle_is_complete(conn, cycle_date)
     if not summary["complete"]:
@@ -255,13 +281,14 @@ if os.environ.get("PICKS_API_NO_SCHEDULER") != "1":
 def root():
     return {
         "service": "fair-line-picks-bot-stage1",
-        "description": "Stage 1 daily capture: Kalshi orderbooks + Odds API h2h odds, once a day ~08:00 ET.",
+        "description": "Stage 2 daily cycle: Kalshi orderbooks + Odds API h2h odds + ESPN team stats + paper rule evaluation, once a day ~08:00 ET.",
         "schedule": "daily ~08:00 America/New_York (pre-game); catch-up run on start/wake after 08:00 if the day is incomplete",
-        "endpoints": ["/health", "/status", "/history"],
+        "endpoints": ["/health", "/status", "/history", "/slip", "/suggestions", "/longshots"],
         "notes": (
             "Free-tier Render service: sleeps after ~15 min idle and the disk is "
             "ephemeral — history resets on restart. Keep-alive pings to /health "
-            "keep it awake. No picks, no trades, no validated edge here."
+            "keep it awake. Paper tracking only: no picks are traded, no "
+            "validated edge here."
         ),
     }
 
@@ -387,6 +414,154 @@ def history(series: str | None = None, ticker: str | None = None, limit: int = 5
             "ticker": ticker,
             "count": len(entries),
             "history": entries,
+        }
+    finally:
+        conn.close()
+
+
+# --- Stage 2: read-only slip endpoints (paper tracking only) ----------------
+# No ledger, balance, or bankroll fields in any response here, ever.
+
+
+def _slip_data(conn, cycle_date):
+    """Today's slip from the rule tables. Empty when no picks qualify —
+    picks are never invented."""
+    evals = [dict(r) for r in store.get_rule_evaluations(conn, cycle_date)]
+    by_ticker = {e["ticker"]: e for e in evals}
+    picks = [e for e in evals if e.get("would_pick")]
+    picks.sort(key=lambda e: (-(e.get("edge") if e.get("edge") is not None else -1.0),
+                              -(e.get("q") if e.get("q") is not None else 0.0),
+                              e.get("ticker") or ""))
+    pick_entries = []
+    for e in picks[:5]:
+        team = e.get("team")
+        home = e.get("home_team")
+        away = e.get("away_team")
+        if home and away:
+            matchup = f"{away} at {home}"
+            opponent = home if team == away else away
+        else:
+            matchup = team
+            opponent = None
+        if opponent:
+            proves_wrong = (
+                f"This pick would be wrong if {opponent} beats {team} "
+                f"— {team} loses the game."
+            )
+        else:
+            proves_wrong = f"This pick would be wrong if {team} loses its game."
+        pick_entries.append({
+            "ticker": e.get("ticker"),
+            "series": e.get("series"),
+            "game_date": e.get("game_date"),
+            "matchup": matchup,
+            "team": team,
+            "kalshi_price": e.get("ask"),
+            "stats_implied_probability": e.get("q"),
+            "edge": e.get("edge"),
+            "threshold": e.get("threshold"),
+            "outcome": e.get("outcome"),
+            "what_would_prove_it_wrong": proves_wrong,
+        })
+    sugg_entries = []
+    for s in store.get_parlay_suggestions(conn, cycle_date):
+        s = dict(s)
+        try:
+            legs = json.loads(s.get("legs") or "[]")
+        except Exception:
+            legs = []
+        sugg_entries.append({
+            "type": "suggestion",
+            "label": "suggestion",
+            "legs": legs,
+            "leg_teams": [by_ticker.get(t, {}).get("team") for t in legs],
+            "n_legs": s.get("n_legs"),
+            "combined_q": s.get("combined_q"),
+            "combined_probability": s.get("combined_q"),
+            "combined_price": s.get("combined_price"),
+            "combined_payout_cents": s.get("combined_payout_cents"),
+            "fee_cents": s.get("fee_cents"),
+            "ev_cents": s.get("ev_cents"),
+            "note": s.get("note"),
+            "outcome": s.get("outcome"),
+        })
+    long_shots = [e for e in evals
+                  if e.get("ask") is not None
+                  and e["ask"] <= config.LONG_SHOT_MAX_ASK]
+    ls_settled = [e for e in long_shots if e.get("outcome") in ("won", "lost")]
+    ls_won = sum(1 for e in ls_settled if e.get("outcome") == "won")
+    long_shot_watch = {
+        "count": len(long_shots),
+        "settled": len(ls_settled),
+        "won": ls_won,
+        "win_rate": round(ls_won / len(ls_settled), 4) if ls_settled else None,
+        "avg_implied": round(
+            sum(e["ask"] for e in long_shots) / len(long_shots), 4)
+            if long_shots else None,
+    }
+    return {
+        "cycle_date": cycle_date,
+        "picks": pick_entries,
+        "parlay_suggestions": sugg_entries,
+        "long_shot_watch": long_shot_watch,
+    }
+
+
+@app.get("/slip")
+def slip():
+    """Read-only slip for today (America/New_York): the day's picks
+    (singles only, max 5), parlay suggestions labeled as suggestions,
+    and the long-shot watch summary. Empty when no picks qualify yet."""
+    conn = store.init_db(DB_PATH)
+    try:
+        today = _today_et().strftime("%Y-%m-%d")
+        return _slip_data(conn, today)
+    finally:
+        conn.close()
+
+
+@app.get("/suggestions")
+def suggestions():
+    """Read-only parlay suggestions for today (fallback for /slip)."""
+    conn = store.init_db(DB_PATH)
+    try:
+        today = _today_et().strftime("%Y-%m-%d")
+        data = _slip_data(conn, today)
+        return {
+            "cycle_date": today,
+            "parlay_suggestions": data["parlay_suggestions"],
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/longshots")
+def longshots():
+    """Read-only long-shot watch for today (fallback for /slip)."""
+    conn = store.init_db(DB_PATH)
+    try:
+        today = _today_et().strftime("%Y-%m-%d")
+        data = _slip_data(conn, today)
+        evals = [dict(r) for r in store.get_rule_evaluations(conn, today)]
+        rows = []
+        for e in evals:
+            if e.get("ask") is not None and e["ask"] <= config.LONG_SHOT_MAX_ASK:
+                home = e.get("home_team")
+                away = e.get("away_team")
+                rows.append({
+                    "ticker": e.get("ticker"),
+                    "series": e.get("series"),
+                    "game_date": e.get("game_date"),
+                    "matchup": f"{away} at {home}" if home and away else e.get("team"),
+                    "team": e.get("team"),
+                    "kalshi_price": e.get("ask"),
+                    "stats_implied_probability": e.get("q"),
+                    "outcome": e.get("outcome"),
+                })
+        return {
+            "cycle_date": today,
+            "long_shot_watch": data["long_shot_watch"],
+            "long_shots": rows,
         }
     finally:
         conn.close()
