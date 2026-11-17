@@ -33,6 +33,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 import config
 import integrity
@@ -41,6 +42,15 @@ import scan
 import store
 
 app = FastAPI(title="Fair Line Picks Bot — Stage 1 capture service")
+
+# CORS: the public viewer page reads /health + /status straight from the
+# browser (GET only, same as the BTC Oracle Pro API). Public read-only data.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET"],
+    allow_headers=["*"],
+)
 
 # --- schedule ---------------------------------------------------------------
 SCHEDULE_HOUR_ET = 8          # ~08:00 America/New_York, pre-game
