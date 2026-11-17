@@ -257,7 +257,7 @@ def root():
         "service": "fair-line-picks-bot-stage1",
         "description": "Stage 1 daily capture: Kalshi orderbooks + Odds API h2h odds, once a day ~08:00 ET.",
         "schedule": "daily ~08:00 America/New_York (pre-game); catch-up run on start/wake after 08:00 if the day is incomplete",
-        "endpoints": ["/health", "/status"],
+        "endpoints": ["/health", "/status", "/history"],
         "notes": (
             "Free-tier Render service: sleeps after ~15 min idle and the disk is "
             "ephemeral — history resets on restart. Keep-alive pings to /health "
@@ -328,6 +328,65 @@ def status():
             "last_run_status": last_status,
             "last_run_summary": last_summary,
             "next_scheduled_run_et": next_run.isoformat(),
+        }
+    finally:
+        conn.close()
+
+
+@app.get("/history")
+def history(series: str | None = None, ticker: str | None = None, limit: int = 500):
+    """Read-only price history from stored Kalshi snapshots.
+
+    Query params: `series` (e.g. KXNBAGAME) and/or `ticker`. With neither,
+    returns snapshots across all markets. Each entry is one stored
+    snapshot for one cycle_date, with the yes bid/ask as stored and
+    the mid derived from them when both are present. No ledger or
+    balance data is included.
+    """
+    limit = max(1, min(limit, 5000))
+    conditions = []
+    params = []
+    if series:
+        conditions.append("series = ?")
+        params.append(series)
+    if ticker:
+        conditions.append("ticker = ?")
+        params.append(ticker)
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    conn = store.init_db(DB_PATH)
+    try:
+        rows = conn.execute(
+            "SELECT cycle_date, ticker, series, market_title, yes_bid, "
+            "yes_ask, fetched_at FROM kalshi_snapshots "
+            f"{where} ORDER BY cycle_date ASC, ticker ASC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        entries = []
+        for row in rows:
+            yes_bid = row["yes_bid"]
+            yes_ask = row["yes_ask"]
+            yes_mid = (
+                (yes_bid + yes_ask) / 2
+                if yes_bid is not None and yes_ask is not None
+                else None
+            )
+            entries.append(
+                {
+                    "cycle_date": row["cycle_date"],
+                    "ticker": row["ticker"],
+                    "series": row["series"],
+                    "market_title": row["market_title"],
+                    "yes_bid": yes_bid,
+                    "yes_ask": yes_ask,
+                    "yes_mid": yes_mid,
+                    "fetched_at": row["fetched_at"],
+                }
+            )
+        return {
+            "series": series,
+            "ticker": ticker,
+            "count": len(entries),
+            "history": entries,
         }
     finally:
         conn.close()
